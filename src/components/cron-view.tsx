@@ -29,7 +29,6 @@ import {
   ChevronUp,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { requestRestart } from "@/lib/restart-store";
 import { SectionBody, SectionHeader, SectionLayout } from "@/components/section-layout";
 import { InlineSpinner, LoadingState } from "@/components/ui/loading-state";
 import {
@@ -2434,10 +2433,7 @@ export function CronView() {
             setTimeout(() => fetchJobs(), 5000);
           }
           if (action === "run") setTimeout(() => fetchRuns(id), 5000);
-          // Config-changing actions should prompt a restart
-          if (["edit", "enable", "disable", "delete"].includes(action)) {
-            requestRestart("Cron job configuration was updated.");
-          }
+          // Cron add/edit/delete/enable/disable apply in-memory on the gateway; no restart needed
           setActionLoading(null);
           return true;
         } else {
@@ -2553,7 +2549,6 @@ export function CronView() {
               setShowCreate(false);
               flash("Cron job created!");
               fetchJobs();
-              requestRestart("New cron job was created.");
             }}
             onCancel={() => setShowCreate(false)}
           />

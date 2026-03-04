@@ -11,7 +11,6 @@ type UsageAlertEvent = {
 
 type UsageAlertCheckResponse = {
   ok?: boolean;
-  monitorEnabled?: boolean;
   alerts?: UsageAlertEvent[];
 };
 
@@ -20,15 +19,9 @@ export function UsageAlertMonitor() {
 
   const check = useCallback(async () => {
     try {
-      const res = await fetch("/api/usage/alerts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "check" }),
-        cache: "no-store",
-      });
+      const res = await fetch("/api/usage/alerts?poll=1", { cache: "no-store" });
       if (!res.ok) return;
       const payload = (await res.json()) as UsageAlertCheckResponse;
-      if (!payload.monitorEnabled) return;
       const alerts = Array.isArray(payload.alerts) ? payload.alerts : [];
       for (const alert of alerts) {
         if (!alert?.id || !alert?.message) continue;
@@ -45,4 +38,3 @@ export function UsageAlertMonitor() {
 
   return null;
 }
-

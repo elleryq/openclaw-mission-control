@@ -1,65 +1,19 @@
-import { mkdir, readFile, writeFile } from "fs/promises";
-import { dirname, join } from "path";
-import { getOpenClawHome } from "@/lib/paths";
-import type { NormalizedGatewaySession } from "@/lib/gateway-sessions";
-
-export type UsageAlertTimeline = "last1h" | "last24h" | "last7d";
-
-export type UsageAlertRule = {
-  id: string;
-  fullModel: string;
-  timeline: UsageAlertTimeline;
-  tokenLimit: number;
-  enabled: boolean;
-  createdAt: number;
-  updatedAt: number;
-};
-
-export type UsageAlertTrigger = {
-  windowKey: string;
-  triggeredAt: number;
-  observedTokens: number;
-};
-
-export type UsageAlertState = {
-  version: 1;
-  monitorEnabled: boolean;
-  rules: UsageAlertRule[];
-  lastTriggeredByRule: Record<string, UsageAlertTrigger>;
-  updatedAt: number;
-};
-
-export type UsageAlertEvaluationStatus = "ok" | "no-model-data" | "no-data-in-window";
-
-export type UsageAlertEvaluation = {
-  ruleId: string;
-  status: UsageAlertEvaluationStatus;
-  reason: string | null;
-  provider: string;
-  fullModel: string;
-  timeline: UsageAlertTimeline;
-  tokenLimit: number;
-  observedTokens: number;
-  totalModelTokens: number;
-  sampleSessions: number;
-  staleSessions: number;
-  exceeded: boolean;
-  windowStart: number;
-  windowEnd: number;
-};
-
-export type UsageAlertEvent = {
-  id: string;
-  ruleId: string;
-  provider: string;
-  fullModel: string;
-  timeline: UsageAlertTimeline;
-  tokenLimit: number;
-  observedTokens: number;
-  windowStart: number;
-  windowEnd: number;
-  message: string;
-};
+import { randomUUID } from "crypto";
+import {
+  ensureUsageDb,
+  sqliteValue,
+  usageDbGetMeta,
+  usageDbQuery,
+  usageDbSetMeta,
+  usageDbTransaction,
+} from "@/lib/usage-db";
+import type {
+  UsageAlertFiringRecord,
+  UsageAlertKind,
+  UsageAlertRuleRecord,
+  UsageAlertScopeType,
+  UsageAlertTimeline,
+} from "@/lib/usage-types";
 
 export type UsageAlertProviderCapability = {
   provider: string;
@@ -68,245 +22,143 @@ export type UsageAlertProviderCapability = {
   note: string;
 };
 
-const ALERTS_FILE_PATH = join(getOpenClawHome(), "mission-control", "usage-alerts.json");
+export type UsageAlertEvaluationStatus = "ok" | "no-data";
 
-const TIMELINE_WINDOW_MS: Record<UsageAlertTimeline, number> = {
-  last1h: 60 * 60 * 1000,
-  last24h: 24 * 60 * 60 * 1000,
-  last7d: 7 * 24 * 60 * 60 * 1000,
+export type UsageAlertEvaluation = {
+  ruleId: string;
+  kind: UsageAlertKind;
+  scopeType: UsageAlertScopeType;
+  scopeValue: string | null;
+  timeline: UsageAlertTimeline;
+  thresholdValue: number;
+  observedValue: number;
+  status: UsageAlertEvaluationStatus;
+  reason: string | null;
+  exceeded: boolean;
+  windowStart: number;
+  windowEnd: number;
 };
 
-const TIMELINE_LABELS: Record<UsageAlertTimeline, string> = {
-  last1h: "last 1 hour",
-  last24h: "last 24 hours",
-  last7d: "last 7 days",
+export type UsageAlertCreateInput = {
+  kind: UsageAlertKind;
+  scopeType: UsageAlertScopeType;
+  scopeValue: string | null;
+  timeline: UsageAlertTimeline;
+  thresholdValue: number;
+  deliveryMode?: string;
+  deliveryChannel?: string | null;
+  deliveryTo?: string | null;
+  bestEffort?: boolean;
 };
 
 const PROVIDER_CAPABILITIES: Record<string, UsageAlertProviderCapability> = {
   openrouter: {
     provider: "openrouter",
     providerUsageApiKnown: true,
-    docsUrl: "https://openrouter.ai/docs/api-reference/limits",
-    note: "OpenRouter exposes key usage/limits endpoints (management key for full key management).",
+    docsUrl: "https://openrouter.ai/docs/api-reference/analytics/get-activity",
+    note: "Provider billing can be read via OpenRouter activity and credits endpoints.",
   },
   anthropic: {
     provider: "anthropic",
     providerUsageApiKnown: true,
     docsUrl: "https://docs.anthropic.com/en/api/data-usage-cost-api",
-    note: "Anthropic provides Usage & Cost APIs for org admins.",
+    note: "Anthropic org admins can expose usage and cost reports.",
   },
   openai: {
     provider: "openai",
     providerUsageApiKnown: true,
-    docsUrl: "https://help.openai.com/en/articles/8554956-understanding-your-api-usage",
-    note: "OpenAI has organization usage endpoints with admin/org access.",
-  },
-  google: {
-    provider: "google",
-    providerUsageApiKnown: false,
-    docsUrl: null,
-    note: "No stable public model-level usage endpoint is currently documented for this workflow.",
-  },
-  groq: {
-    provider: "groq",
-    providerUsageApiKnown: false,
-    docsUrl: null,
-    note: "No stable public model-level usage endpoint is currently documented for this workflow.",
-  },
-  xai: {
-    provider: "xai",
-    providerUsageApiKnown: false,
-    docsUrl: null,
-    note: "No stable public model-level usage endpoint is currently documented for this workflow.",
-  },
-  mistral: {
-    provider: "mistral",
-    providerUsageApiKnown: false,
-    docsUrl: null,
-    note: "No stable public model-level usage endpoint is currently documented for this workflow.",
-  },
-  cerebras: {
-    provider: "cerebras",
-    providerUsageApiKnown: false,
-    docsUrl: null,
-    note: "No stable public model-level usage endpoint is currently documented for this workflow.",
-  },
-  huggingface: {
-    provider: "huggingface",
-    providerUsageApiKnown: false,
-    docsUrl: null,
-    note: "No stable public model-level usage endpoint is currently documented for this workflow.",
+    docsUrl: "https://platform.openai.com/docs/api-reference/usage/costs",
+    note: "OpenAI org billing should come from organization usage/cost endpoints.",
   },
   minimax: {
     provider: "minimax",
     providerUsageApiKnown: false,
-    docsUrl: null,
-    note: "No stable public model-level usage endpoint is currently documented for this workflow.",
+    docsUrl: "https://docs.openclaw.ai/concepts/usage-tracking",
+    note: "OpenClaw can track usage locally, but Mission Control treats billing as estimate only.",
   },
   zai: {
     provider: "zai",
     providerUsageApiKnown: false,
-    docsUrl: null,
-    note: "No stable public model-level usage endpoint is currently documented for this workflow.",
-  },
-  ollama: {
-    provider: "ollama",
-    providerUsageApiKnown: false,
-    docsUrl: null,
-    note: "Local models do not expose provider billing APIs; Mission Control uses session telemetry.",
-  },
-  lmstudio: {
-    provider: "lmstudio",
-    providerUsageApiKnown: false,
-    docsUrl: null,
-    note: "Local models do not expose provider billing APIs; Mission Control uses session telemetry.",
+    docsUrl: "https://docs.openclaw.ai/concepts/usage-tracking",
+    note: "OpenClaw can track usage locally, but Mission Control treats billing as estimate only.",
   },
   unknown: {
     provider: "unknown",
     providerUsageApiKnown: false,
     docsUrl: null,
-    note: "Provider capability is unknown; Mission Control uses session telemetry.",
+    note: "Mission Control falls back to local telemetry when provider billing truth is unavailable.",
   },
 };
 
-function defaultState(): UsageAlertState {
-  return {
-    version: 1,
-    monitorEnabled: true,
-    rules: [],
-    lastTriggeredByRule: {},
-    updatedAt: Date.now(),
-  };
+function toBool(value: unknown): boolean {
+  return value === true || value === 1 || value === "1";
 }
 
-function toPositiveInt(value: unknown, fallback = 0): number {
-  const n = Number(value);
-  if (!Number.isFinite(n) || n <= 0) return fallback;
-  return Math.floor(n);
+function timelineBounds(now: number, timeline: UsageAlertTimeline): { start: number; end: number } {
+  if (timeline === "last1h") return { start: now - 60 * 60 * 1000, end: now };
+  if (timeline === "last24h") return { start: now - 24 * 60 * 60 * 1000, end: now };
+  if (timeline === "last7d") return { start: now - 7 * 24 * 60 * 60 * 1000, end: now };
+  if (timeline === "todayUtc") {
+    const date = new Date(now);
+    const start = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+    return { start, end: now };
+  }
+  const date = new Date(now);
+  const start = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1);
+  return { start, end: now };
 }
 
-function toBoolean(value: unknown, fallback = false): boolean {
-  if (typeof value === "boolean") return value;
-  return fallback;
+function timelineKey(now: number, timeline: UsageAlertTimeline): string {
+  if (timeline === "todayUtc") {
+    const d = new Date(now).toISOString().slice(0, 10);
+    return `${timeline}:${d}`;
+  }
+  if (timeline === "monthUtc") {
+    const d = new Date(now);
+    return `${timeline}:${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+  }
+  const width =
+    timeline === "last1h"
+      ? 60 * 60 * 1000
+      : timeline === "last24h"
+        ? 24 * 60 * 60 * 1000
+        : 7 * 24 * 60 * 60 * 1000;
+  return `${timeline}:${Math.floor(now / width)}`;
+}
+
+function formatObserved(kind: UsageAlertKind, observedValue: number): string {
+  return kind === "token-usage"
+    ? `${Math.round(observedValue).toLocaleString("en-US")} tokens`
+    : `$${observedValue.toFixed(2)}`;
+}
+
+function formatThreshold(kind: UsageAlertKind, thresholdValue: number): string {
+  return kind === "token-usage"
+    ? `${Math.round(thresholdValue).toLocaleString("en-US")} tokens`
+    : `$${thresholdValue.toFixed(2)}`;
 }
 
 export function normalizeTimeline(value: unknown): UsageAlertTimeline | null {
   const raw = String(value || "").trim();
-  if (raw === "last1h" || raw === "last24h" || raw === "last7d") return raw;
-  return null;
+  return raw === "last1h" ||
+    raw === "last24h" ||
+    raw === "last7d" ||
+    raw === "todayUtc" ||
+    raw === "monthUtc"
+    ? raw
+    : null;
 }
 
-function normalizeRule(raw: unknown): UsageAlertRule | null {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const row = raw as Record<string, unknown>;
-  const id = String(row.id || "").trim();
-  const fullModel = String(row.fullModel || "").trim();
-  const timeline = normalizeTimeline(row.timeline);
-  const tokenLimit = toPositiveInt(row.tokenLimit, 0);
-  const createdAt = toPositiveInt(row.createdAt, Date.now());
-  const updatedAt = toPositiveInt(row.updatedAt, Date.now());
-  if (!id || !fullModel || !timeline || tokenLimit <= 0) return null;
-  return {
-    id,
-    fullModel,
-    timeline,
-    tokenLimit,
-    enabled: toBoolean(row.enabled, true),
-    createdAt,
-    updatedAt,
-  };
+export function normalizeAlertKind(value: unknown): UsageAlertKind | null {
+  const raw = String(value || "").trim();
+  return raw === "token-usage" || raw === "estimated-spend" || raw === "provider-spend"
+    ? raw
+    : null;
 }
 
-function normalizeTrigger(raw: unknown): UsageAlertTrigger | null {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const row = raw as Record<string, unknown>;
-  const windowKey = String(row.windowKey || "").trim();
-  const triggeredAt = toPositiveInt(row.triggeredAt, 0);
-  const observedTokens = toPositiveInt(row.observedTokens, 0);
-  if (!windowKey || triggeredAt <= 0) return null;
-  return { windowKey, triggeredAt, observedTokens };
-}
-
-function normalizeState(raw: unknown): UsageAlertState {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return defaultState();
-  const obj = raw as Record<string, unknown>;
-  const rules = Array.isArray(obj.rules)
-    ? obj.rules.map(normalizeRule).filter((v): v is UsageAlertRule => Boolean(v))
-    : [];
-  const lastTriggeredByRuleInput = obj.lastTriggeredByRule;
-  const lastTriggeredByRule: Record<string, UsageAlertTrigger> = {};
-  if (lastTriggeredByRuleInput && typeof lastTriggeredByRuleInput === "object" && !Array.isArray(lastTriggeredByRuleInput)) {
-    for (const [ruleId, triggerRaw] of Object.entries(lastTriggeredByRuleInput)) {
-      const parsed = normalizeTrigger(triggerRaw);
-      if (parsed) lastTriggeredByRule[ruleId] = parsed;
-    }
-  }
-  const activeRuleIds = new Set(rules.map((rule) => rule.id));
-  for (const ruleId of Object.keys(lastTriggeredByRule)) {
-    if (!activeRuleIds.has(ruleId)) delete lastTriggeredByRule[ruleId];
-  }
-  return {
-    version: 1,
-    monitorEnabled: toBoolean(obj.monitorEnabled, true),
-    rules,
-    lastTriggeredByRule,
-    updatedAt: toPositiveInt(obj.updatedAt, Date.now()),
-  };
-}
-
-function isNoEntryError(err: unknown): boolean {
-  if (typeof err === "object" && err !== null && "code" in err) {
-    return (err as { code?: unknown }).code === "ENOENT";
-  }
-  const msg = String(err || "").toLowerCase();
-  return msg.includes("no such file");
-}
-
-export async function readUsageAlertState(): Promise<{ state: UsageAlertState; warning?: string }> {
-  try {
-    const raw = await readFile(ALERTS_FILE_PATH, "utf-8");
-    return { state: normalizeState(JSON.parse(raw)) };
-  } catch (err) {
-    if (isNoEntryError(err)) return { state: defaultState() };
-    return {
-      state: defaultState(),
-      warning: `Usage alarm settings could not be loaded: ${String(err)}`,
-    };
-  }
-}
-
-export async function writeUsageAlertState(state: UsageAlertState): Promise<void> {
-  const payload: UsageAlertState = {
-    version: 1,
-    monitorEnabled: state.monitorEnabled,
-    rules: state.rules,
-    lastTriggeredByRule: state.lastTriggeredByRule,
-    updatedAt: Date.now(),
-  };
-  await mkdir(dirname(ALERTS_FILE_PATH), { recursive: true });
-  await writeFile(ALERTS_FILE_PATH, JSON.stringify(payload, null, 2), "utf-8");
-}
-
-export function modelProvider(fullModel: string): string {
-  const provider = String(fullModel || "").split("/")[0]?.trim().toLowerCase();
-  return provider || "unknown";
-}
-
-function timelineWindowStart(now: number, timeline: UsageAlertTimeline): number {
-  return now - TIMELINE_WINDOW_MS[timeline];
-}
-
-function shortModel(fullModel: string): string {
-  return fullModel.split("/").pop() || fullModel;
-}
-
-function formatInt(n: number): string {
-  return Math.max(0, Math.floor(n)).toLocaleString("en-US");
-}
-
-function timelineWindowKey(now: number, timeline: UsageAlertTimeline): string {
-  const width = TIMELINE_WINDOW_MS[timeline];
-  return `${timeline}:${Math.floor(now / width)}`;
+export function normalizeScopeType(value: unknown): UsageAlertScopeType | null {
+  const raw = String(value || "").trim();
+  return raw === "model" || raw === "provider" || raw === "global" ? raw : null;
 }
 
 export function getProviderCapabilities(): Record<string, UsageAlertProviderCapability> {
@@ -314,108 +166,335 @@ export function getProviderCapabilities(): Record<string, UsageAlertProviderCapa
 }
 
 export function getProviderCapability(provider: string): UsageAlertProviderCapability {
-  const key = String(provider || "").trim().toLowerCase();
-  return PROVIDER_CAPABILITIES[key] || PROVIDER_CAPABILITIES.unknown;
+  return PROVIDER_CAPABILITIES[String(provider || "").trim().toLowerCase()] || PROVIDER_CAPABILITIES.unknown;
 }
 
-export function evaluateUsageAlertRules(params: {
-  rules: UsageAlertRule[];
-  sessions: NormalizedGatewaySession[];
-  now: number;
-  lastTriggeredByRule: Record<string, UsageAlertTrigger>;
-  emitAlerts: boolean;
-}): {
-  evaluations: UsageAlertEvaluation[];
-  alerts: UsageAlertEvent[];
-  nextLastTriggeredByRule: Record<string, UsageAlertTrigger>;
-  changed: boolean;
-} {
-  const { rules, sessions, now, lastTriggeredByRule, emitAlerts } = params;
-  const evaluations: UsageAlertEvaluation[] = [];
-  const alerts: UsageAlertEvent[] = [];
-  const nextLastTriggeredByRule: Record<string, UsageAlertTrigger> = {
-    ...lastTriggeredByRule,
+export async function readAlertMonitorEnabled(): Promise<boolean> {
+  const raw = await usageDbGetMeta("alerts.monitor_enabled");
+  return raw == null ? true : raw === "1";
+}
+
+export async function setAlertMonitorEnabled(enabled: boolean): Promise<void> {
+  await usageDbSetMeta("alerts.monitor_enabled", enabled ? "1" : "0");
+}
+
+export async function listUsageAlertRules(): Promise<UsageAlertRuleRecord[]> {
+  await ensureUsageDb();
+  const rows = await usageDbQuery<{
+    id?: string;
+    kind?: UsageAlertKind;
+    scope_type?: UsageAlertScopeType;
+    scope_value?: string | null;
+    timeline?: UsageAlertTimeline;
+    threshold_type?: "gte";
+    threshold_value?: number;
+    delivery_mode?: string;
+    delivery_channel?: string | null;
+    delivery_to?: string | null;
+    best_effort?: number | boolean;
+    enabled?: number | boolean;
+    cooldown_window_key?: string | null;
+    created_at_ms?: number;
+    updated_at_ms?: number;
+  }>(
+    "SELECT * FROM alert_rules ORDER BY created_at_ms DESC;",
+  );
+  return rows.map((row) => ({
+    id: String(row.id || ""),
+    kind: (row.kind || "token-usage") as UsageAlertKind,
+    scopeType: (row.scope_type || "global") as UsageAlertScopeType,
+    scopeValue: row.scope_value == null ? null : String(row.scope_value),
+    timeline: (row.timeline || "last24h") as UsageAlertTimeline,
+    thresholdType: "gte",
+    thresholdValue: Number(row.threshold_value || 0),
+    deliveryMode: String(row.delivery_mode || "none"),
+    deliveryChannel: row.delivery_channel == null ? null : String(row.delivery_channel),
+    deliveryTo: row.delivery_to == null ? null : String(row.delivery_to),
+    bestEffort: toBool(row.best_effort),
+    enabled: toBool(row.enabled),
+    cooldownWindowKey: row.cooldown_window_key == null ? null : String(row.cooldown_window_key),
+    createdAt: Number(row.created_at_ms || 0),
+    updatedAt: Number(row.updated_at_ms || 0),
+  }));
+}
+
+export async function createUsageAlertRule(input: UsageAlertCreateInput): Promise<UsageAlertRuleRecord> {
+  await ensureUsageDb();
+  const now = Date.now();
+  const rule: UsageAlertRuleRecord = {
+    id: randomUUID(),
+    kind: input.kind,
+    scopeType: input.scopeType,
+    scopeValue: input.scopeValue,
+    timeline: input.timeline,
+    thresholdType: "gte",
+    thresholdValue: input.thresholdValue,
+    deliveryMode: input.deliveryMode || "none",
+    deliveryChannel: input.deliveryChannel ?? null,
+    deliveryTo: input.deliveryTo ?? null,
+    bestEffort: Boolean(input.bestEffort),
+    enabled: true,
+    cooldownWindowKey: null,
+    createdAt: now,
+    updatedAt: now,
   };
-  let changed = false;
+  await usageDbTransaction([
+    [
+      "INSERT INTO alert_rules (",
+      "id, kind, scope_type, scope_value, timeline, threshold_type, threshold_value,",
+      "delivery_mode, delivery_channel, delivery_to, best_effort, enabled, cooldown_window_key, created_at_ms, updated_at_ms",
+      ") VALUES (",
+      [
+        sqliteValue(rule.id),
+        sqliteValue(rule.kind),
+        sqliteValue(rule.scopeType),
+        rule.scopeValue ? sqliteValue(rule.scopeValue) : "NULL",
+        sqliteValue(rule.timeline),
+        sqliteValue("gte"),
+        rule.thresholdValue,
+        sqliteValue(rule.deliveryMode),
+        rule.deliveryChannel ? sqliteValue(rule.deliveryChannel) : "NULL",
+        rule.deliveryTo ? sqliteValue(rule.deliveryTo) : "NULL",
+        rule.bestEffort ? 1 : 0,
+        1,
+        "NULL",
+        now,
+        now,
+      ].join(", "),
+      ");",
+    ].join(" "),
+  ]);
+  return rule;
+}
 
-  for (const rule of rules) {
-    const provider = modelProvider(rule.fullModel);
-    const allModelSessions = sessions.filter((s) => s.fullModel === rule.fullModel);
-    const totalModelTokens = allModelSessions.reduce((sum, s) => sum + s.totalTokens, 0);
-    const windowStart = timelineWindowStart(now, rule.timeline);
-    const windowEnd = now;
-    const inWindow = allModelSessions.filter(
-      (s) => s.updatedAt > 0 && s.updatedAt >= windowStart && s.updatedAt <= now,
+export async function updateUsageAlertRule(
+  ruleId: string,
+  patch: Partial<UsageAlertCreateInput & { enabled: boolean }>,
+): Promise<void> {
+  const updates: string[] = [`updated_at_ms = ${Date.now()}`];
+  if (patch.kind) updates.push(`kind = ${sqliteValue(patch.kind)}`);
+  if (patch.scopeType) updates.push(`scope_type = ${sqliteValue(patch.scopeType)}`);
+  if (patch.scopeValue !== undefined) {
+    updates.push(`scope_value = ${patch.scopeValue ? sqliteValue(patch.scopeValue) : "NULL"}`);
+  }
+  if (patch.timeline) updates.push(`timeline = ${sqliteValue(patch.timeline)}`);
+  if (patch.thresholdValue !== undefined) updates.push(`threshold_value = ${patch.thresholdValue}`);
+  if (patch.deliveryMode !== undefined) updates.push(`delivery_mode = ${sqliteValue(patch.deliveryMode || "none")}`);
+  if (patch.deliveryChannel !== undefined) {
+    updates.push(`delivery_channel = ${patch.deliveryChannel ? sqliteValue(patch.deliveryChannel) : "NULL"}`);
+  }
+  if (patch.deliveryTo !== undefined) {
+    updates.push(`delivery_to = ${patch.deliveryTo ? sqliteValue(patch.deliveryTo) : "NULL"}`);
+  }
+  if (patch.bestEffort !== undefined) updates.push(`best_effort = ${patch.bestEffort ? 1 : 0}`);
+  if (patch.enabled !== undefined) updates.push(`enabled = ${patch.enabled ? 1 : 0}`);
+  if (updates.length === 1) return;
+  await usageDbTransaction([
+    `UPDATE alert_rules SET ${updates.join(", ")} WHERE id = ${sqliteValue(ruleId)};`,
+  ]);
+}
+
+export async function deleteUsageAlertRule(ruleId: string): Promise<void> {
+  await usageDbTransaction([
+    `DELETE FROM alert_rules WHERE id = ${sqliteValue(ruleId)};`,
+  ]);
+}
+
+async function queryObservedValue(rule: UsageAlertRuleRecord, now: number): Promise<number> {
+  const bounds = timelineBounds(now, rule.timeline);
+  const filters = [`observed_at_ms >= ${bounds.start}`, `observed_at_ms <= ${bounds.end}`];
+  if (rule.scopeType === "model" && rule.scopeValue) {
+    filters.push(`full_model = ${sqliteValue(rule.scopeValue)}`);
+  } else if (rule.scopeType === "provider" && rule.scopeValue) {
+    filters.push(`provider = ${sqliteValue(rule.scopeValue)}`);
+  }
+
+  if (rule.kind === "token-usage" || rule.kind === "estimated-spend") {
+    const valueColumn = rule.kind === "token-usage" ? "SUM(total_tokens_delta)" : "SUM(estimated_cost_usd)";
+    const rows = await usageDbQuery<{ value?: number }>(
+      `SELECT ${valueColumn} AS value FROM usage_events WHERE ${filters.join(" AND ")};`,
     );
-    const observedTokens = inWindow.reduce((sum, s) => sum + s.totalTokens, 0);
-    const staleSessions = inWindow.filter((s) => !s.totalTokensFresh).length;
+    return Number(rows[0]?.value || 0);
+  }
 
-    let status: UsageAlertEvaluationStatus = "ok";
-    let reason: string | null = null;
-    if (allModelSessions.length === 0) {
-      status = "no-model-data";
-      reason = "No usage data is available yet for this model.";
-    } else if (inWindow.length === 0) {
-      status = "no-data-in-window";
-      reason = `No session activity for this model in ${TIMELINE_LABELS[rule.timeline]}.`;
-    }
+  const providerFilters = [`bucket_start_ms >= ${bounds.start}`, `bucket_start_ms <= ${bounds.end}`];
+  if (rule.scopeType === "model" && rule.scopeValue) {
+    providerFilters.push(`full_model = ${sqliteValue(rule.scopeValue)}`);
+  } else if (rule.scopeType === "provider" && rule.scopeValue) {
+    providerFilters.push(`provider = ${sqliteValue(rule.scopeValue)}`);
+  }
+  const rows = await usageDbQuery<{ value?: number }>(
+    `SELECT SUM(spend_usd) AS value FROM provider_billing_buckets WHERE ${providerFilters.join(" AND ")};`,
+  );
+  return Number(rows[0]?.value || 0);
+}
 
-    const exceeded = status === "ok" && observedTokens >= rule.tokenLimit;
-
+export async function previewUsageAlerts(now = Date.now()): Promise<UsageAlertEvaluation[]> {
+  await ensureUsageDb();
+  const rules = await listUsageAlertRules();
+  const evaluations: UsageAlertEvaluation[] = [];
+  for (const rule of rules) {
+    const bounds = timelineBounds(now, rule.timeline);
+    const observedValue = await queryObservedValue(rule, now);
     evaluations.push({
       ruleId: rule.id,
-      status,
-      reason,
-      provider,
-      fullModel: rule.fullModel,
+      kind: rule.kind,
+      scopeType: rule.scopeType,
+      scopeValue: rule.scopeValue,
       timeline: rule.timeline,
-      tokenLimit: rule.tokenLimit,
-      observedTokens,
-      totalModelTokens,
-      sampleSessions: inWindow.length,
-      staleSessions,
-      exceeded,
-      windowStart,
-      windowEnd,
-    });
-
-    if (!emitAlerts || !rule.enabled || !exceeded) continue;
-
-    const windowKey = timelineWindowKey(now, rule.timeline);
-    const previous = nextLastTriggeredByRule[rule.id];
-    if (previous?.windowKey === windowKey) continue;
-
-    nextLastTriggeredByRule[rule.id] = {
-      windowKey,
-      triggeredAt: now,
-      observedTokens,
-    };
-    changed = true;
-    alerts.push({
-      id: `${rule.id}:${windowKey}`,
-      ruleId: rule.id,
-      provider,
-      fullModel: rule.fullModel,
-      timeline: rule.timeline,
-      tokenLimit: rule.tokenLimit,
-      observedTokens,
-      windowStart,
-      windowEnd,
-      message:
-        `Token alarm triggered for ${shortModel(rule.fullModel)}: ` +
-        `${formatInt(observedTokens)} tokens in ${TIMELINE_LABELS[rule.timeline]} ` +
-        `(limit ${formatInt(rule.tokenLimit)}).`,
+      thresholdValue: rule.thresholdValue,
+      observedValue,
+      status: observedValue > 0 ? "ok" : "no-data",
+      reason: observedValue > 0 ? null : "No matching usage data in the selected window.",
+      exceeded: rule.enabled && observedValue >= rule.thresholdValue,
+      windowStart: bounds.start,
+      windowEnd: bounds.end,
     });
   }
-
-  const activeIds = new Set(rules.map((rule) => rule.id));
-  for (const ruleId of Object.keys(nextLastTriggeredByRule)) {
-    if (!activeIds.has(ruleId)) {
-      delete nextLastTriggeredByRule[ruleId];
-      changed = true;
-    }
-  }
-
-  return { evaluations, alerts, nextLastTriggeredByRule, changed };
+  return evaluations;
 }
 
+export async function evaluateAndStoreUsageAlerts(now = Date.now()): Promise<{
+  evaluations: UsageAlertEvaluation[];
+  firings: UsageAlertFiringRecord[];
+}> {
+  await ensureUsageDb();
+  const monitorEnabled = await readAlertMonitorEnabled();
+  const rules = await listUsageAlertRules();
+  const evaluations: UsageAlertEvaluation[] = [];
+  const statements: string[] = [];
+  const firings: UsageAlertFiringRecord[] = [];
+
+  for (const rule of rules) {
+    const bounds = timelineBounds(now, rule.timeline);
+    const observedValue = await queryObservedValue(rule, now);
+    const exceeded = rule.enabled && monitorEnabled && observedValue >= rule.thresholdValue;
+    const evaluation: UsageAlertEvaluation = {
+      ruleId: rule.id,
+      kind: rule.kind,
+      scopeType: rule.scopeType,
+      scopeValue: rule.scopeValue,
+      timeline: rule.timeline,
+      thresholdValue: rule.thresholdValue,
+      observedValue,
+      status: observedValue > 0 ? "ok" : "no-data",
+      reason: observedValue > 0 ? null : "No matching usage data in the selected window.",
+      exceeded,
+      windowStart: bounds.start,
+      windowEnd: bounds.end,
+    };
+    evaluations.push(evaluation);
+    if (!exceeded) continue;
+    const windowKey = timelineKey(now, rule.timeline);
+    const message = [
+      "Usage alert triggered:",
+      `${rule.kind} ${rule.scopeType}${rule.scopeValue ? ` ${rule.scopeValue}` : ""}`,
+      `${formatObserved(rule.kind, observedValue)} vs ${formatThreshold(rule.kind, rule.thresholdValue)}`,
+    ].join(" ");
+    statements.push(
+      [
+        "INSERT OR IGNORE INTO alert_firings (",
+        "id, rule_id, window_key, observed_value, message, fired_at_ms, delivery_status, delivery_error",
+        ") VALUES (",
+        [
+          sqliteValue(randomUUID()),
+          sqliteValue(rule.id),
+          sqliteValue(windowKey),
+          observedValue,
+          sqliteValue(message),
+          now,
+          sqliteValue("pending"),
+          "NULL",
+        ].join(", "),
+        ");",
+      ].join(" "),
+      `UPDATE alert_rules SET cooldown_window_key = ${sqliteValue(windowKey)}, updated_at_ms = ${now} WHERE id = ${sqliteValue(rule.id)};`,
+    );
+    firings.push({
+      id: "",
+      ruleId: rule.id,
+      windowKey,
+      observedValue,
+      message,
+      firedAt: now,
+      deliveryStatus: "pending",
+      deliveryError: null,
+    });
+  }
+
+  if (statements.length > 0) {
+    await usageDbTransaction(statements);
+  }
+  await usageDbSetMeta("alerts.last_evaluated_ms", String(now));
+  return {
+    evaluations,
+    firings: await listRecentAlertFirings(20),
+  };
+}
+
+export async function listRecentAlertFirings(limit = 20): Promise<UsageAlertFiringRecord[]> {
+  await ensureUsageDb();
+  const rows = await usageDbQuery<{
+    id?: string;
+    rule_id?: string;
+    window_key?: string;
+    observed_value?: number;
+    message?: string;
+    fired_at_ms?: number;
+    delivery_status?: "pending" | "sent" | "failed";
+    delivery_error?: string | null;
+  }>(
+    `SELECT * FROM alert_firings ORDER BY fired_at_ms DESC LIMIT ${Math.max(1, Math.min(limit, 100))};`,
+  );
+  return rows.map((row) => ({
+    id: String(row.id || ""),
+    ruleId: String(row.rule_id || ""),
+    windowKey: String(row.window_key || ""),
+    observedValue: Number(row.observed_value || 0),
+    message: String(row.message || ""),
+    firedAt: Number(row.fired_at_ms || 0),
+    deliveryStatus: (row.delivery_status || "pending") as "pending" | "sent" | "failed",
+    deliveryError: row.delivery_error == null ? null : String(row.delivery_error),
+  }));
+}
+
+export async function pollPendingAlertFirings(limit = 20): Promise<UsageAlertFiringRecord[]> {
+  const pending = await usageDbQuery<{
+    id?: string;
+    rule_id?: string;
+    window_key?: string;
+    observed_value?: number;
+    message?: string;
+    fired_at_ms?: number;
+    delivery_status?: "pending" | "sent" | "failed";
+    delivery_error?: string | null;
+  }>(
+    `SELECT * FROM alert_firings WHERE delivery_status = 'pending' ORDER BY fired_at_ms ASC LIMIT ${Math.max(1, Math.min(limit, 50))};`,
+  );
+  if (pending.length === 0) return [];
+  const ids = pending.map((row) => sqliteValue(String(row.id || ""))).join(", ");
+  await usageDbTransaction([
+    `UPDATE alert_firings SET delivery_status = 'sent' WHERE id IN (${ids});`,
+  ]);
+  return pending.map((row) => ({
+    id: String(row.id || ""),
+    ruleId: String(row.rule_id || ""),
+    windowKey: String(row.window_key || ""),
+    observedValue: Number(row.observed_value || 0),
+    message: String(row.message || ""),
+    firedAt: Number(row.fired_at_ms || 0),
+    deliveryStatus: "sent",
+    deliveryError: row.delivery_error == null ? null : String(row.delivery_error),
+  }));
+}
+
+export async function readAlertRuntimeStatus(): Promise<{
+  monitorEnabled: boolean;
+  lastEvaluatedMs: number | null;
+}> {
+  const lastRaw = await usageDbGetMeta("alerts.last_evaluated_ms");
+  return {
+    monitorEnabled: await readAlertMonitorEnabled(),
+    lastEvaluatedMs: lastRaw ? Number(lastRaw) || null : null,
+  };
+}

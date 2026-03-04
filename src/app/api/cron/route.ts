@@ -297,6 +297,18 @@ async function listCronJobs(): Promise<CronList> {
   return gatewayCall<CronList>("cron.list", {}, 10000);
 }
 
+function isSystemManagedCronJob(job: CronJob): boolean {
+  const name = String(job.name || "").trim().toLowerCase();
+  const description = String(job.description || "").trim().toLowerCase();
+  return name.startsWith("mc-") && description.includes("mission control system-managed usage job");
+}
+
+function filterUserVisibleCronJobs(data: CronList): CronList {
+  return {
+    jobs: (data.jobs || []).filter((job) => !isSystemManagedCronJob(job)),
+  };
+}
+
 async function getCronJobById(id: string): Promise<CronJob | null> {
   const data = await listCronJobs();
   return (data.jobs || []).find((job) => job.id === id) || null;
@@ -362,7 +374,7 @@ export async function GET(request: NextRequest) {
 
     // Default: list all jobs
     const data = await listCronJobs();
-    return NextResponse.json(data);
+    return NextResponse.json(filterUserVisibleCronJobs(data));
   } catch (err) {
     console.error("Cron GET error:", err);
     return NextResponse.json({ error: String(err) }, { status: 500 });

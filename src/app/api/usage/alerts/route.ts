@@ -1,14 +1,19 @@
-import { randomUUID } from "crypto";
 import { NextRequest, NextResponse } from "next/server";
-import { fetchGatewaySessions } from "@/lib/gateway-sessions";
-import type { NormalizedGatewaySession } from "@/lib/gateway-sessions";
 import {
-  evaluateUsageAlertRules,
+  createUsageAlertRule,
+  deleteUsageAlertRule,
+  evaluateAndStoreUsageAlerts,
   getProviderCapabilities,
+  listRecentAlertFirings,
+  listUsageAlertRules,
+  normalizeAlertKind,
+  normalizeScopeType,
   normalizeTimeline,
-  readUsageAlertState,
-  type UsageAlertRule,
-  writeUsageAlertState,
+  pollPendingAlertFirings,
+  previewUsageAlerts,
+  readAlertRuntimeStatus,
+  setAlertMonitorEnabled,
+  updateUsageAlertRule,
 } from "@/lib/usage-alerts";
 
 export const dynamic = "force-dynamic";
@@ -17,67 +22,57 @@ function badRequest(message: string) {
   return NextResponse.json({ ok: false, error: message }, { status: 400 });
 }
 
-function toPositiveInt(value: unknown): number | null {
+function toPositiveNumber(value: unknown): number | null {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return null;
-  return Math.floor(n);
+  return n;
 }
 
-function findRuleIndex(rules: UsageAlertRule[], ruleId: string): number {
-  return rules.findIndex((rule) => rule.id === ruleId);
-}
-
-async function buildStatusPayload(emitAlerts: boolean) {
-  const { state, warning } = await readUsageAlertState();
-  let sessions: NormalizedGatewaySession[] = [];
-  let degraded = false;
-  let sessionsWarning: string | undefined;
-  try {
-    sessions = await fetchGatewaySessions(12000);
-  } catch (err) {
-    degraded = true;
-    sessionsWarning = `Failed to read live sessions: ${String(err)}`;
-  }
-
-  const { evaluations, alerts, nextLastTriggeredByRule, changed } = evaluateUsageAlertRules({
-    rules: state.rules,
-    sessions,
-    now: Date.now(),
-    lastTriggeredByRule: state.lastTriggeredByRule,
-    emitAlerts: emitAlerts && state.monitorEnabled && !degraded,
-  });
-
-  if (emitAlerts && changed) {
-    state.lastTriggeredByRule = nextLastTriggeredByRule;
-    state.updatedAt = Date.now();
-    await writeUsageAlertState(state);
-  }
-
-  const warnings = [warning, sessionsWarning].filter(Boolean) as string[];
-
+async function buildStatusPayload() {
+  const [runtime, rules, evaluations, recentFirings] = await Promise.all([
+    readAlertRuntimeStatus(),
+    listUsageAlertRules(),
+    previewUsageAlerts(),
+    listRecentAlertFirings(20),
+  ]);
+  const rulesCompat = rules.map((rule) => ({
+    ...rule,
+    fullModel: rule.scopeType === "model" ? rule.scopeValue || "" : "",
+    tokenLimit: rule.thresholdValue,
+  }));
+  const evaluationsCompat = evaluations.map((evaluation) => ({
+    ...evaluation,
+    provider:
+      evaluation.scopeType === "provider"
+        ? evaluation.scopeValue || "unknown"
+        : evaluation.scopeType === "model"
+          ? String(evaluation.scopeValue || "").split("/")[0] || "unknown"
+          : "global",
+    fullModel: evaluation.scopeType === "model" ? evaluation.scopeValue || "" : "",
+    tokenLimit: evaluation.thresholdValue,
+    observedTokens: evaluation.observedValue,
+    totalModelTokens: evaluation.observedValue,
+    sampleSessions: 0,
+    staleSessions: 0,
+  }));
   return NextResponse.json({
     ok: true,
-    monitorEnabled: state.monitorEnabled,
-    rules: state.rules,
-    evaluations,
-    alerts: emitAlerts ? alerts : [],
+    monitorEnabled: runtime.monitorEnabled,
+    lastEvaluatedMs: runtime.lastEvaluatedMs,
+    rules: rulesCompat,
+    evaluations: evaluationsCompat,
+    recentFirings,
     providerCapabilities: getProviderCapabilities(),
-    warning: warnings.length ? warnings.join(" | ") : undefined,
-    degraded,
     timestamp: Date.now(),
   });
 }
 
-export async function GET() {
-  const { state, warning } = await readUsageAlertState();
-  return NextResponse.json({
-    ok: true,
-    monitorEnabled: state.monitorEnabled,
-    rules: state.rules,
-    providerCapabilities: getProviderCapabilities(),
-    warning: warning || undefined,
-    timestamp: Date.now(),
-  });
+export async function GET(request: NextRequest) {
+  if (request.nextUrl.searchParams.get("poll") === "1") {
+    const alerts = await pollPendingAlertFirings(20);
+    return NextResponse.json({ ok: true, alerts, timestamp: Date.now() });
+  }
+  return buildStatusPayload();
 }
 
 export async function POST(request: NextRequest) {
@@ -86,114 +81,121 @@ export async function POST(request: NextRequest) {
     const action = String(body.action || "").trim().toLowerCase();
 
     if (action === "status") {
-      return await buildStatusPayload(false);
+      return buildStatusPayload();
     }
     if (action === "check") {
-      return await buildStatusPayload(true);
-    }
-
-    const { state } = await readUsageAlertState();
-
-    if (action === "set-monitor") {
-      state.monitorEnabled = Boolean(body.monitorEnabled);
-      state.updatedAt = Date.now();
-      await writeUsageAlertState(state);
-      return NextResponse.json({ ok: true, monitorEnabled: state.monitorEnabled });
-    }
-
-    if (action === "create") {
-      const fullModel = String(body.fullModel || "").trim();
-      const timeline = normalizeTimeline(body.timeline);
-      const tokenLimit = toPositiveInt(body.tokenLimit);
-      if (!fullModel) return badRequest("Model is required.");
-      if (!timeline) return badRequest("Timeline must be one of: last1h, last24h, last7d.");
-      if (!tokenLimit) return badRequest("Token limit must be a positive number.");
-
-      const duplicate = state.rules.some(
-        (rule) =>
-          rule.fullModel === fullModel &&
-          rule.timeline === timeline &&
-          rule.tokenLimit === tokenLimit,
-      );
-      if (duplicate) {
-        return badRequest("An identical alarm rule already exists.");
-      }
-
-      const now = Date.now();
-      state.rules.push({
-        id: randomUUID(),
-        fullModel,
-        timeline,
-        tokenLimit,
-        enabled: true,
-        createdAt: now,
-        updatedAt: now,
+      const result = await evaluateAndStoreUsageAlerts();
+      const runtime = await readAlertRuntimeStatus();
+      const rules = await listUsageAlertRules();
+      return NextResponse.json({
+        ok: true,
+        monitorEnabled: runtime.monitorEnabled,
+        lastEvaluatedMs: runtime.lastEvaluatedMs,
+        rules: rules.map((rule) => ({
+          ...rule,
+          fullModel: rule.scopeType === "model" ? rule.scopeValue || "" : "",
+          tokenLimit: rule.thresholdValue,
+        })),
+        evaluations: result.evaluations.map((evaluation) => ({
+          ...evaluation,
+          provider:
+            evaluation.scopeType === "provider"
+              ? evaluation.scopeValue || "unknown"
+              : evaluation.scopeType === "model"
+                ? String(evaluation.scopeValue || "").split("/")[0] || "unknown"
+                : "global",
+          fullModel: evaluation.scopeType === "model" ? evaluation.scopeValue || "" : "",
+          tokenLimit: evaluation.thresholdValue,
+          observedTokens: evaluation.observedValue,
+          totalModelTokens: evaluation.observedValue,
+          sampleSessions: 0,
+          staleSessions: 0,
+        })),
+        alerts: result.firings.map((firing) => ({ id: firing.id || `${firing.ruleId}:${firing.windowKey}`, message: firing.message })),
+        recentFirings: result.firings,
+        providerCapabilities: getProviderCapabilities(),
+        timestamp: Date.now(),
       });
-      state.updatedAt = now;
-      await writeUsageAlertState(state);
-      return NextResponse.json({ ok: true, rules: state.rules, monitorEnabled: state.monitorEnabled });
+    }
+    if (action === "poll-notifications") {
+      const alerts = await pollPendingAlertFirings(20);
+      return NextResponse.json({ ok: true, alerts, timestamp: Date.now() });
+    }
+    if (action === "set-monitor" || action === "set-monitor-enabled") {
+      await setAlertMonitorEnabled(Boolean(body.monitorEnabled));
+      const runtime = await readAlertRuntimeStatus();
+      return NextResponse.json({ ok: true, monitorEnabled: runtime.monitorEnabled });
     }
 
-    if (action === "update") {
+    if (action === "create" || action === "create-rule") {
+      const kind = normalizeAlertKind(body.kind) || "token-usage";
+      const scopeType = normalizeScopeType(body.scopeType) || "model";
+      const timeline = normalizeTimeline(body.timeline);
+      const thresholdValue =
+        toPositiveNumber(body.thresholdValue) ??
+        toPositiveNumber(body.tokenLimit);
+      const scopeValueRaw =
+        body.scopeValue !== undefined ? String(body.scopeValue || "").trim() : String(body.fullModel || "").trim();
+      const scopeValue = scopeType === "global" ? null : scopeValueRaw || null;
+
+      if (!timeline) return badRequest("Timeline must be one of: last1h, last24h, last7d, todayUtc, monthUtc.");
+      if (!thresholdValue) return badRequest("Threshold must be a positive number.");
+      if (scopeType !== "global" && !scopeValue) return badRequest("scopeValue is required for model/provider rules.");
+
+      await createUsageAlertRule({
+        kind,
+        scopeType,
+        scopeValue,
+        timeline,
+        thresholdValue,
+        deliveryMode: typeof body.deliveryMode === "string" ? body.deliveryMode : "none",
+        deliveryChannel: typeof body.deliveryChannel === "string" ? body.deliveryChannel : null,
+        deliveryTo: typeof body.deliveryTo === "string" ? body.deliveryTo : null,
+        bestEffort: Boolean(body.bestEffort),
+      });
+      return buildStatusPayload();
+    }
+
+    if (action === "update" || action === "update-rule") {
       const ruleId = String(body.ruleId || "").trim();
       if (!ruleId) return badRequest("ruleId is required.");
-      const idx = findRuleIndex(state.rules, ruleId);
-      if (idx < 0) return badRequest("Rule not found.");
-
+      const patch: Parameters<typeof updateUsageAlertRule>[1] = {};
+      const kind = body.kind === undefined ? null : normalizeAlertKind(body.kind);
+      const scopeType = body.scopeType === undefined ? null : normalizeScopeType(body.scopeType);
       const timeline = body.timeline === undefined ? null : normalizeTimeline(body.timeline);
-      if (body.timeline !== undefined && !timeline) {
-        return badRequest("Timeline must be one of: last1h, last24h, last7d.");
+      if (body.kind !== undefined && !kind) return badRequest("Invalid alert kind.");
+      if (body.scopeType !== undefined && !scopeType) return badRequest("Invalid scope type.");
+      if (body.timeline !== undefined && !timeline) return badRequest("Invalid timeline.");
+      if (kind) patch.kind = kind;
+      if (scopeType) patch.scopeType = scopeType;
+      if (body.scopeValue !== undefined) patch.scopeValue = String(body.scopeValue || "").trim() || null;
+      if (timeline) patch.timeline = timeline;
+      if (body.thresholdValue !== undefined || body.tokenLimit !== undefined) {
+        const thresholdValue = toPositiveNumber(body.thresholdValue) ?? toPositiveNumber(body.tokenLimit);
+        if (!thresholdValue) return badRequest("Threshold must be a positive number.");
+        patch.thresholdValue = thresholdValue;
       }
-      const tokenLimit = body.tokenLimit === undefined ? null : toPositiveInt(body.tokenLimit);
-      if (body.tokenLimit !== undefined && !tokenLimit) {
-        return badRequest("Token limit must be a positive number.");
-      }
-      const fullModel =
-        body.fullModel === undefined ? null : String(body.fullModel || "").trim();
-      if (body.fullModel !== undefined && !fullModel) {
-        return badRequest("Model must be a non-empty string.");
-      }
-
-      const prev = state.rules[idx];
-      state.rules[idx] = {
-        ...prev,
-        fullModel: fullModel ?? prev.fullModel,
-        timeline: timeline ?? prev.timeline,
-        tokenLimit: tokenLimit ?? prev.tokenLimit,
-        enabled: body.enabled === undefined ? prev.enabled : Boolean(body.enabled),
-        updatedAt: Date.now(),
-      };
-      state.updatedAt = Date.now();
-      await writeUsageAlertState(state);
-      return NextResponse.json({ ok: true, rules: state.rules, monitorEnabled: state.monitorEnabled });
+      if (body.deliveryMode !== undefined) patch.deliveryMode = String(body.deliveryMode || "none");
+      if (body.deliveryChannel !== undefined) patch.deliveryChannel = String(body.deliveryChannel || "").trim() || null;
+      if (body.deliveryTo !== undefined) patch.deliveryTo = String(body.deliveryTo || "").trim() || null;
+      if (body.bestEffort !== undefined) patch.bestEffort = Boolean(body.bestEffort);
+      if (body.enabled !== undefined) patch.enabled = Boolean(body.enabled);
+      await updateUsageAlertRule(ruleId, patch);
+      return buildStatusPayload();
     }
 
-    if (action === "toggle") {
+    if (action === "toggle" || action === "set-enabled") {
       const ruleId = String(body.ruleId || "").trim();
       if (!ruleId) return badRequest("ruleId is required.");
-      const idx = findRuleIndex(state.rules, ruleId);
-      if (idx < 0) return badRequest("Rule not found.");
-      const enabled = Boolean(body.enabled);
-      state.rules[idx] = {
-        ...state.rules[idx],
-        enabled,
-        updatedAt: Date.now(),
-      };
-      state.updatedAt = Date.now();
-      await writeUsageAlertState(state);
-      return NextResponse.json({ ok: true, rules: state.rules, monitorEnabled: state.monitorEnabled });
+      await updateUsageAlertRule(ruleId, { enabled: Boolean(body.enabled) });
+      return buildStatusPayload();
     }
 
-    if (action === "delete") {
+    if (action === "delete" || action === "delete-rule") {
       const ruleId = String(body.ruleId || "").trim();
       if (!ruleId) return badRequest("ruleId is required.");
-      const before = state.rules.length;
-      state.rules = state.rules.filter((rule) => rule.id !== ruleId);
-      if (state.rules.length === before) return badRequest("Rule not found.");
-      delete state.lastTriggeredByRule[ruleId];
-      state.updatedAt = Date.now();
-      await writeUsageAlertState(state);
-      return NextResponse.json({ ok: true, rules: state.rules, monitorEnabled: state.monitorEnabled });
+      await deleteUsageAlertRule(ruleId);
+      return buildStatusPayload();
     }
 
     return badRequest(`Unknown action: ${action}`);

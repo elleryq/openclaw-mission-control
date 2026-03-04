@@ -149,6 +149,7 @@ type HistoricalData = {
 } | null;
 
 type UsageData = {
+  asOfMs?: number;
   totals: {
     sessions: number;
     inputTokens: number;
@@ -186,6 +187,39 @@ type UsageData = {
   sessionFileSizes: { agentId: string; sizeBytes: number; fileCount: number }[];
   historical: HistoricalData;
   diagnostics?: UsageDiagnostics;
+  estimatedSpend?: {
+    totalUsd: number | null;
+    windows: Record<Period, { usd: number | null; coveragePct: number }>;
+    byModel: Array<{ fullModel: string; usd: number | null; coveragePct: number }>;
+    sourceLabel: string;
+  };
+  providerBilling?: {
+    providers: Array<{
+      provider: string;
+      available: boolean;
+      reason?: string;
+      requiredCredential?: string;
+      freshness: "fresh" | "stale" | "unknown";
+      bucketGranularity: "day" | null;
+      latestBucketStartMs: number | null;
+      totalUsd30d: number | null;
+      currentMonthUsd: number | null;
+    }>;
+  };
+  reconciliation?: {
+    summary: {
+      reconciledBuckets: number;
+      mismatchBuckets: number;
+      estimatedOnlyBuckets: number;
+      providerOnlyBuckets: number;
+      staleBuckets: number;
+    };
+  };
+  coverage?: {
+    estimatedPricingCoveragePct: number;
+    invoiceGradeProviders: string[];
+    estimateOnlyProviders: string[];
+  };
 };
 
 type UsageAlarmTimeline = "last1h" | "last24h" | "last7d";
@@ -230,6 +264,8 @@ type UsageAlarmsPayload = {
   rules: UsageAlarmRule[];
   evaluations: UsageAlarmEvaluation[];
   alerts?: Array<{ id: string; message: string }>;
+  recentFirings?: Array<{ id: string; message: string; firedAt?: number }>;
+  lastEvaluatedMs?: number | null;
   providerCapabilities: Record<string, UsageAlarmProviderCapability>;
   warning?: string;
   degraded?: boolean;
@@ -580,6 +616,7 @@ export function UsageView() {
   const [newAlarmLimit, setNewAlarmLimit] = useState("100000");
   const [orBilling, setOrBilling] = useState<OpenRouterBillingResult | null>(null);
   const [orLoading, setOrLoading] = useState(true);
+  const [retryBusy, setRetryBusy] = useState(false);
 
   useEffect(() => {
     if (tokenFlowModel === "all" || !data) return;
@@ -857,7 +894,7 @@ export function UsageView() {
       <SectionLayout>
         <SectionHeader
           title="Usage"
-          description="Cost estimation, token economics, cache metrics, and agent throughput."
+          description="Live telemetry, estimated spend, provider-reported billing, and reconciliation status."
         />
         <SectionBody width="narrow" padding="roomy" innerClassName="space-y-4">
           <section className="rounded-2xl border border-red-200 bg-white p-5 shadow-sm md:p-6 dark:border-red-500/20 dark:bg-[#171a1d]">
@@ -887,13 +924,14 @@ export function UsageView() {
               <Button
                 type="button"
                 size="sm"
+                disabled={retryBusy}
                 onClick={() => {
-                  setLoading(true);
-                  void fetchData();
+                  setRetryBusy(true);
+                  void fetchData().finally(() => setRetryBusy(false));
                 }}
               >
-                <RefreshCw className="h-3.5 w-3.5" />
-                Retry Loading Usage
+                <RefreshCw className={cn("h-3.5 w-3.5", retryBusy && "animate-spin")} />
+                {retryBusy ? "Retrying..." : "Retry Loading Usage"}
               </Button>
               <Button asChild type="button" size="sm" variant="outline">
                 <a href={gmailComposeHref} target="_blank" rel="noopener noreferrer">
@@ -924,6 +962,9 @@ export function UsageView() {
 
   const { totals, liveCost, sessions, modelBreakdown, modelConfig, peakSession, sessionFileSizes, historical } = data;
   const diagnostics = data.diagnostics;
+  const providerSnapshots = data.providerBilling?.providers || [];
+  const providerReported30d = providerSnapshots.reduce((sum, provider) => sum + (provider.totalUsd30d || 0), 0);
+  const reconciliationSummary = data.reconciliation?.summary;
   const pricingDiagnostics = diagnostics?.pricing;
   const hasPricingGap = (pricingDiagnostics?.uncoveredSessions || 0) > 0;
   const pricedSessionCount = pricingDiagnostics?.coveredSessions ?? totals.sessions;
@@ -944,7 +985,7 @@ export function UsageView() {
     <SectionLayout>
       <SectionHeader
         title="Usage"
-        description="Cost estimation, token economics, cache metrics, and agent throughput."
+        description="Live telemetry, estimated spend, provider-reported billing, and reconciliation status."
         actions={
           <div className="flex items-center gap-2">
             <div className="inline-flex rounded-lg border border-border bg-muted p-1">
@@ -1040,8 +1081,68 @@ export function UsageView() {
         )}
 
         <Panel
-          title="Max Tokens Alarm"
-          subtitle="Persistent per-model token alarms with browser notification + chat message delivery."
+          title="Usage Truth"
+          subtitle="Local estimates, provider-reported billing, and reconciliation are shown separately."
+        >
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+            <MetricTile
+              variant="surface"
+              label="Estimated"
+              value={fmtCost(data.estimatedSpend?.totalUsd ?? liveCost.totalEstimatedUsd)}
+              sub={data.estimatedSpend?.sourceLabel || "Estimated from local telemetry and pricing"}
+            />
+            <MetricTile
+              variant="surface"
+              label="Provider-reported"
+              value={providerSnapshots.some((provider) => provider.available) ? fmtCost(providerReported30d) : "n/a"}
+              sub={providerSnapshots.some((provider) => provider.available) ? "30-day provider billing" : "Billing access missing or estimate only"}
+            />
+            <MetricTile
+              variant="surface"
+              label="Reconciled"
+              value={String(reconciliationSummary?.reconciledBuckets || 0)}
+              sub={`${reconciliationSummary?.mismatchBuckets || 0} mismatch · ${reconciliationSummary?.staleBuckets || 0} stale`}
+            />
+          </div>
+          <div className="mt-3 grid gap-2 md:grid-cols-3">
+            {providerSnapshots.map((provider) => (
+              <div key={provider.provider} className="rounded-lg border border-foreground/10 bg-card/40 px-3 py-2 text-xs">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold text-foreground/90">{provider.provider}</span>
+                  <span className={cn(
+                    "font-medium",
+                    provider.available
+                      ? provider.freshness === "fresh"
+                        ? "text-emerald-700 dark:text-emerald-300"
+                        : provider.freshness === "stale"
+                          ? "text-amber-700 dark:text-amber-300"
+                          : "text-muted-foreground"
+                      : "text-rose-700 dark:text-rose-300",
+                  )}>
+                    {provider.available
+                      ? provider.freshness === "fresh"
+                        ? "Provider-reported"
+                        : provider.freshness === "stale"
+                          ? "Stale"
+                          : "Unknown"
+                      : provider.reason === "Billing access not configured"
+                        ? "Billing access missing"
+                        : "Estimate only"}
+                  </span>
+                </div>
+                <p className="mt-1 text-muted-foreground/70">
+                  {provider.available
+                    ? `${fmtCost(provider.totalUsd30d || 0)} in 30d`
+                    : provider.reason || "Estimate only"}
+                </p>
+              </div>
+            ))}
+          </div>
+        </Panel>
+
+        <Panel
+          title="Usage Alerts"
+          subtitle="Server-evaluated alerts. Browser notifications only render pending firings."
           actions={(
             <Button
               type="button"
@@ -1100,7 +1201,7 @@ export function UsageView() {
 
           <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-foreground/10 bg-card/40 px-3 py-2 text-xs">
             <p className="text-foreground/80">
-              Monitor status:{" "}
+              Runtime:{" "}
               <span className={cn(
                 "font-medium",
                 alarms?.monitorEnabled === false ? "text-red-700 dark:text-red-300" : "text-emerald-700 dark:text-emerald-300",
@@ -1120,18 +1221,23 @@ export function UsageView() {
               })}
               className="text-xs"
             >
-              {alarms?.monitorEnabled === false ? "Enable monitor" : "Pause monitor"}
+              {alarms?.monitorEnabled === false ? "Enable evaluator" : "Pause evaluator"}
             </Button>
           </div>
           <p className="mt-1 text-[11px] text-muted-foreground/65">
-            Desktop alerts require browser notification permission (Settings → Notifications & Chat).
+            Desktop notifications only render already-fired alerts. Server evaluation is independent of tab visibility.
           </p>
+          {alarms?.lastEvaluatedMs ? (
+            <p className="mt-1 text-[11px] text-muted-foreground/65">
+              Last server evaluation {fmtAgo(alarms.lastEvaluatedMs)}.
+            </p>
+          ) : null}
 
           {selectedProviderCapability && (
             <div className="mt-2 rounded-lg border border-foreground/10 bg-background/50 px-3 py-2 text-xs text-muted-foreground/80">
               <p>
-                Provider context ({selectedProvider}): {selectedProviderCapability.note} Alarms are evaluated from local
-                session telemetry for per-model token accuracy.
+                Provider context ({selectedProvider}): {selectedProviderCapability.note} Quick-add rules from this panel
+                create token-usage alerts evaluated from the local telemetry ledger.
               </p>
               {selectedProviderCapability.docsUrl && (
                 <a
@@ -1155,7 +1261,7 @@ export function UsageView() {
           <div className="mt-3 space-y-2">
             {(alarms?.rules || []).length === 0 ? (
               <p className="rounded-lg border border-foreground/10 bg-card/40 px-3 py-2 text-xs text-muted-foreground/75">
-                No token alarms configured yet.
+                No usage alerts configured yet.
               </p>
             ) : (
               (alarms?.rules || []).map((rule) => {
@@ -1233,7 +1339,7 @@ export function UsageView() {
         <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
           <MetricTile
             variant="surface"
-            label={orBilling?.available ? "Estimated Cost (Local)" : "Estimated Cost"}
+            label="Estimated Spend (Local)"
             value={fmtCost(liveCost.totalEstimatedUsd)}
             sub={
               hasPricingGap && pricingDiagnostics
@@ -1245,7 +1351,7 @@ export function UsageView() {
           />
           <MetricTile
             variant="surface"
-            label="Cost / Session"
+            label="Estimated / Session"
             value={pricedSessionCount > 0 ? fmtCost(costPerSession) : "n/a"}
             sub={`across ${pricedSessionCount} priced session${pricedSessionCount !== 1 ? "s" : ""}`}
           />
@@ -1293,7 +1399,7 @@ export function UsageView() {
 
         {/* Provider Billing (OpenRouter) */}
         {orLoading ? (
-          <Panel title="Provider Billing" subtitle="Loading OpenRouter billing data...">
+          <Panel title="Provider Billing" subtitle="Loading OpenRouter provider-reported billing...">
             <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
               {[1, 2, 3, 4].map((i) => (
                 <div
@@ -1310,7 +1416,7 @@ export function UsageView() {
         ) : orBilling?.available ? (
           <Panel
             title="Provider Billing"
-            subtitle="Real cost data from OpenRouter Management API"
+            subtitle="Provider-reported cost data from OpenRouter Management API"
             actions={
               <span className="text-[10px] text-muted-foreground/50">
                 Fetched {new Date(orBilling.fetchedAt).toLocaleTimeString("en-US", withTimeFormat({ hour: "numeric", minute: "2-digit" }, timeFormat))}
@@ -1530,7 +1636,7 @@ export function UsageView() {
 
         {/* Historical Cost Trend chart */}
         {costTimeSeries.length > 1 && (
-          <Panel title="Historical Cost Trend" subtitle="Hourly cost from persistent usage history">
+          <Panel title="Historical Estimated Spend" subtitle="Hourly local estimates from the durable usage ledger">
             <ChartContainer config={costTrendChartConfig} className="h-56 w-full">
               <ComposedChart data={costTimeSeries} margin={{ top: 4, right: 6, left: 0, bottom: 0 }}>
                 <defs>

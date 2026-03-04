@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { readFile, readdir, stat } from "fs/promises";
 import { join } from "path";
 import { getOpenClawHome } from "@/lib/paths";
@@ -7,12 +7,14 @@ import { fetchGatewaySessions } from "@/lib/gateway-sessions";
 import type { NormalizedGatewaySession } from "@/lib/gateway-sessions";
 import { estimateCostUsd } from "@/lib/model-metadata";
 import { fetchOpenRouterPricing } from "@/lib/openrouter-pricing";
-import { appendSessionSnapshots, aggregateHistory } from "@/lib/usage-history";
+import { ingestGatewaySessionsToLedger, readLedgerUsageSnapshot } from "@/lib/usage-ledger";
+import { ensureProviderBillingFreshness, getAllProviderSnapshots } from "@/lib/provider-billing/shared";
+import { readReconciliationSnapshot, runUsageReconciliation } from "@/lib/reconciliation";
+import { ensureUsageScheduler } from "@/lib/usage-scheduler";
+import type { UsageApiResponse } from "@/lib/usage-types";
 
 const OPENCLAW_HOME = getOpenClawHome();
 export const dynamic = "force-dynamic";
-
-/* ── Types ──────────────────────────────────────── */
 
 type SessionEntry = {
   key: string;
@@ -54,18 +56,6 @@ type ModelStatusData = {
   };
 };
 
-type Period = "last1h" | "last24h" | "last7d" | "allTime";
-
-type ActivityPoint = {
-  ts: number;
-  input: number;
-  output: number;
-  total: number;
-  sessions: number;
-};
-
-type SessionWithAgent = SessionEntry & { agentId: string };
-
 type DiagnosticsSource = {
   ok: boolean;
   error: string | null;
@@ -80,11 +70,14 @@ type MissingPricingModel = {
 type UsageDiagnostics = {
   sources: {
     gateway: DiagnosticsSource;
-    usageHistoryWrite: DiagnosticsSource;
+    usageLedgerWrite: DiagnosticsSource;
     historical: DiagnosticsSource;
     modelStatus: DiagnosticsSource;
     agentDirectory: DiagnosticsSource;
     sessionStorage: DiagnosticsSource & { failedAgents: string[] };
+    scheduler: DiagnosticsSource;
+    providerBilling: DiagnosticsSource;
+    reconciliation: DiagnosticsSource;
   };
   pricing: {
     coveredSessions: number;
@@ -95,6 +88,18 @@ type UsageDiagnostics = {
   warnings: string[];
 };
 
+type Period = "last1h" | "last24h" | "last7d" | "allTime";
+
+type ActivityPoint = {
+  ts: number;
+  input: number;
+  output: number;
+  total: number;
+  sessions: number;
+};
+
+type SessionWithAgent = SessionEntry & { agentId: string };
+
 async function readJsonSafe<T>(path: string, fallback: T): Promise<T> {
   try {
     const raw = await readFile(path, "utf-8");
@@ -102,51 +107,6 @@ async function readJsonSafe<T>(path: string, fallback: T): Promise<T> {
   } catch {
     return fallback;
   }
-}
-
-function buildActivitySeries(
-  sessions: SessionWithAgent[],
-  now: number
-): Record<Period, ActivityPoint[]> {
-  const buildFixed = (windowMs: number, binMs: number): ActivityPoint[] => {
-    const bins = Math.max(1, Math.ceil(windowMs / binMs));
-    const start = now - bins * binMs;
-    const points: ActivityPoint[] = Array.from({ length: bins }, (_, i) => ({
-      ts: start + i * binMs,
-      input: 0,
-      output: 0,
-      total: 0,
-      sessions: 0,
-    }));
-    for (const s of sessions) {
-      if (!s.updatedAt || s.updatedAt < start || s.updatedAt > now) continue;
-      const idx = Math.floor((s.updatedAt - start) / binMs);
-      if (idx < 0 || idx >= points.length) continue;
-      points[idx].input += s.inputTokens;
-      points[idx].output += s.outputTokens;
-      points[idx].total += s.totalTokens;
-      points[idx].sessions += 1;
-    }
-    return points;
-  };
-
-  const validTimestamps = sessions
-    .map((s) => s.updatedAt)
-    .filter((t): t is number => Number.isFinite(t) && t > 0);
-  const earliest = validTimestamps.length ? Math.min(...validTimestamps) : now - 24 * 3600_000;
-  const spanMs = Math.max(now - earliest, 3600_000);
-  const targetBins = 30;
-  const rawBinMs = Math.ceil(spanMs / targetBins);
-  const binFloor = 15 * 60_000;
-  const dynamicBinMs = Math.max(binFloor, Math.ceil(rawBinMs / binFloor) * binFloor);
-  const dynamicWindowMs = dynamicBinMs * targetBins;
-
-  return {
-    last1h: buildFixed(3600_000, 5 * 60_000),
-    last24h: buildFixed(24 * 3600_000, 3600_000),
-    last7d: buildFixed(7 * 24 * 3600_000, 6 * 3600_000),
-    allTime: buildFixed(dynamicWindowMs, dynamicBinMs),
-  };
 }
 
 function getErrorCode(err: unknown): string | null {
@@ -162,11 +122,13 @@ function errorMessage(err: unknown): string {
   return String(err).slice(0, 280);
 }
 
-/* ── GET /api/usage ──────────────────────────────── */
+function modelProvider(fullModel: string): string {
+  const provider = String(fullModel || "").split("/")[0]?.trim().toLowerCase();
+  return provider || "unknown";
+}
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
-    // 1. Config for agents list
     const configPath = join(OPENCLAW_HOME, "openclaw.json");
     const config = await readJsonSafe<Record<string, unknown>>(configPath, {});
     const agentsConfig = (config.agents || {}) as Record<string, unknown>;
@@ -175,14 +137,18 @@ export async function GET() {
     const defaultModelCfg = defaults.model as Record<string, unknown> | undefined;
     const defaultPrimary = (defaultModelCfg?.primary as string) || "unknown";
     const defaultFallbacks = (defaultModelCfg?.fallbacks as string[]) || [];
+
     const diagnostics: UsageDiagnostics = {
       sources: {
         gateway: { ok: true, error: null },
-        usageHistoryWrite: { ok: true, error: null },
+        usageLedgerWrite: { ok: true, error: null },
         historical: { ok: true, error: null },
         modelStatus: { ok: true, error: null },
         agentDirectory: { ok: true, error: null },
         sessionStorage: { ok: true, error: null, failedAgents: [] },
+        scheduler: { ok: true, error: null },
+        providerBilling: { ok: true, error: null },
+        reconciliation: { ok: true, error: null },
       },
       pricing: {
         coveredSessions: 0,
@@ -193,7 +159,14 @@ export async function GET() {
       warnings: [],
     };
 
-    // Collect all agent IDs
+    try {
+      await ensureUsageScheduler(request.nextUrl.origin);
+    } catch (err) {
+      diagnostics.sources.scheduler.ok = false;
+      diagnostics.sources.scheduler.error = errorMessage(err);
+      diagnostics.warnings.push("Mission Control could not refresh its system-managed usage jobs.");
+    }
+
     const agentIds: string[] = [];
     for (const c of configList) {
       if (c.id) agentIds.push(c.id as string);
@@ -211,7 +184,6 @@ export async function GET() {
       }
     }
 
-    // 2. Read sessions from gateway source of truth
     const allSessions: SessionWithAgent[] = [];
     let liveSessions: NormalizedGatewaySession[] = [];
     try {
@@ -223,15 +195,30 @@ export async function GET() {
     }
 
     try {
-      await appendSessionSnapshots(liveSessions);
+      await ingestGatewaySessionsToLedger(liveSessions);
     } catch (err) {
-      diagnostics.sources.usageHistoryWrite.ok = false;
-      diagnostics.sources.usageHistoryWrite.error = errorMessage(err);
-      diagnostics.warnings.push("Failed to persist usage snapshots; historical trend may lag.");
+      diagnostics.sources.usageLedgerWrite.ok = false;
+      diagnostics.sources.usageLedgerWrite.error = errorMessage(err);
+      diagnostics.warnings.push("Failed to persist usage deltas; historical windows may lag.");
     }
-    // Fetch dynamic OpenRouter pricing as fallback for models not in static metadata
-    const dynamicPricing = await fetchOpenRouterPricing();
 
+    try {
+      await ensureProviderBillingFreshness();
+    } catch (err) {
+      diagnostics.sources.providerBilling.ok = false;
+      diagnostics.sources.providerBilling.error = errorMessage(err);
+      diagnostics.warnings.push("Provider billing collectors did not refresh cleanly.");
+    }
+
+    try {
+      await runUsageReconciliation();
+    } catch (err) {
+      diagnostics.sources.reconciliation.ok = false;
+      diagnostics.sources.reconciliation.error = errorMessage(err);
+      diagnostics.warnings.push("Reconciliation did not complete; trust labels may be stale.");
+    }
+
+    const dynamicPricing = await fetchOpenRouterPricing().catch(() => null);
     const missingPricingModels = new Map<string, MissingPricingModel>();
     let missingPricingSessions = 0;
 
@@ -242,7 +229,7 @@ export async function GET() {
         s.outputTokens,
         s.cacheReadTokens,
         s.cacheWriteTokens,
-        dynamicPricing,
+        dynamicPricing || undefined,
       );
       if (cost == null) {
         missingPricingSessions += 1;
@@ -276,19 +263,14 @@ export async function GET() {
         percentUsed: s.contextTokens
           ? Math.round((s.totalTokens / Math.max(1, s.contextTokens)) * 100)
           : undefined,
-        remainingTokens: s.contextTokens
-          ? s.contextTokens - s.totalTokens
-          : undefined,
+        remainingTokens: s.contextTokens ? s.contextTokens - s.totalTokens : undefined,
         estimatedCostUsd: cost,
         agentId: s.agentId || "unknown",
       });
     }
 
-    // 3. Sort by updatedAt desc
     allSessions.sort((a, b) => b.updatedAt - a.updatedAt);
 
-    // 4. Aggregate stats
-    // By model
     const byModel: Record<string, {
       model: string;
       fullModel: string;
@@ -305,7 +287,6 @@ export async function GET() {
       estimatedCostUsd: number | null;
     }> = {};
 
-    // By agent
     const byAgent: Record<string, {
       agentId: string;
       sessions: number;
@@ -320,15 +301,6 @@ export async function GET() {
       estimatedCostUsd: number | null;
     }> = {};
 
-    // Time buckets (last 24h, 7d, 30d, all time)
-    const now = Date.now();
-    const buckets = {
-      last1h: { input: 0, output: 0, total: 0, sessions: 0 },
-      last24h: { input: 0, output: 0, total: 0, sessions: 0 },
-      last7d: { input: 0, output: 0, total: 0, sessions: 0 },
-      allTime: { input: 0, output: 0, total: 0, sessions: 0 },
-    };
-
     let grandTotalInput = 0;
     let grandTotalOutput = 0;
     let grandTotalTokens = 0;
@@ -336,7 +308,7 @@ export async function GET() {
     let grandTotalCacheWrite = 0;
     let grandTotalCostUsd = 0;
     let staleSessions = 0;
-    let peakSession: (SessionEntry & { agentId: string }) | null = null;
+    let peakSession: SessionWithAgent | null = null;
 
     for (const s of allSessions) {
       grandTotalInput += s.inputTokens;
@@ -346,38 +318,8 @@ export async function GET() {
       grandTotalCacheWrite += s.cacheWriteTokens;
       if (s.estimatedCostUsd != null) grandTotalCostUsd += s.estimatedCostUsd;
       if (!s.totalTokensFresh) staleSessions += 1;
+      if (!peakSession || s.totalTokens > peakSession.totalTokens) peakSession = s;
 
-      // Peak session
-      if (!peakSession || s.totalTokens > peakSession.totalTokens) {
-        peakSession = s;
-      }
-
-      // Time buckets
-      const age = now - s.updatedAt;
-      buckets.allTime.input += s.inputTokens;
-      buckets.allTime.output += s.outputTokens;
-      buckets.allTime.total += s.totalTokens;
-      buckets.allTime.sessions += 1;
-      if (age < 7 * 86400_000) {
-        buckets.last7d.input += s.inputTokens;
-        buckets.last7d.output += s.outputTokens;
-        buckets.last7d.total += s.totalTokens;
-        buckets.last7d.sessions += 1;
-      }
-      if (age < 86400_000) {
-        buckets.last24h.input += s.inputTokens;
-        buckets.last24h.output += s.outputTokens;
-        buckets.last24h.total += s.totalTokens;
-        buckets.last24h.sessions += 1;
-      }
-      if (age < 3600_000) {
-        buckets.last1h.input += s.inputTokens;
-        buckets.last1h.output += s.outputTokens;
-        buckets.last1h.total += s.totalTokens;
-        buckets.last1h.sessions += 1;
-      }
-
-      // By model
       if (!byModel[s.model]) {
         byModel[s.model] = {
           model: s.model,
@@ -409,7 +351,6 @@ export async function GET() {
         bm.estimatedCostUsd = (bm.estimatedCostUsd ?? 0) + s.estimatedCostUsd;
       }
 
-      // By agent
       if (!byAgent[s.agentId]) {
         byAgent[s.agentId] = {
           agentId: s.agentId,
@@ -440,14 +381,12 @@ export async function GET() {
       }
     }
 
-    // Compute avg percent for models
     for (const m of Object.values(byModel)) {
       if (m.contextTokens > 0 && m.sessions > 0) {
         m.avgPercentUsed = Math.round((m.totalTokens / m.sessions) / m.contextTokens * 100);
       }
     }
 
-    // 5. Model config (primary/fallbacks/aliases/auth)
     let modelStatus: ModelStatusData | null = null;
     try {
       const summary = await buildModelsSummary();
@@ -458,7 +397,6 @@ export async function GET() {
       diagnostics.warnings.push("Model routing metadata is unavailable right now.");
     }
 
-    // Per-agent model configs
     const agentModels: { agentId: string; primary: string; fallbacks: string[] }[] = [];
     for (const cfg of configList) {
       const id = cfg.id as string;
@@ -469,7 +407,6 @@ export async function GET() {
       agentModels.push({ agentId: id, primary, fallbacks });
     }
 
-    // 6. Session log size per agent
     const sessionFileSizes: { agentId: string; sizeBytes: number; fileCount: number }[] = [];
     for (const agentId of agentIds) {
       const sessDir = join(OPENCLAW_HOME, "agents", agentId, "sessions");
@@ -500,48 +437,16 @@ export async function GET() {
       );
     }
 
-    // Convert Sets to arrays for JSON
-    const modelBreakdown = Object.values(byModel)
-      .map((m) => ({
-        ...m,
-        agents: Array.from(m.agents),
-      }))
-      .sort((a, b) => b.totalTokens - a.totalTokens);
+    const ledger = await readLedgerUsageSnapshot();
+    const providerBilling = await getAllProviderSnapshots();
+    const reconciliation = await readReconciliationSnapshot();
 
-    const agentBreakdown = Object.values(byAgent)
-      .map((a) => ({
-        ...a,
-        models: Array.from(a.models),
-      }))
-      .sort((a, b) => b.totalTokens - a.totalTokens);
-
-    const activitySeries = buildActivitySeries(allSessions, now);
-
-    // Per-model activity series for Token Flow filter (all vs specific model)
-    const activitySeriesByModel: Record<string, Record<Period, ActivityPoint[]>> = {};
-    for (const modelKey of Object.keys(byModel)) {
-      const sessionsForModel = allSessions.filter((s) => s.model === modelKey);
-      activitySeriesByModel[modelKey] = buildActivitySeries(sessionsForModel, now);
-    }
-
-    // Load historical aggregates (never blocks if CSV missing)
-    let historical = null;
-    try {
-      historical = await aggregateHistory();
-    } catch (err) {
-      diagnostics.sources.historical.ok = false;
-      diagnostics.sources.historical.error = errorMessage(err);
-      diagnostics.warnings.push("Historical usage aggregation failed; trend charts may be missing.");
-    }
-    const uncoveredModels = Array.from(missingPricingModels.values())
-      .sort((a, b) => b.sessions - a.sessions);
+    const uncoveredModels = Array.from(missingPricingModels.values()).sort((a, b) => b.sessions - a.sessions);
     const coveredSessions = allSessions.length - missingPricingSessions;
     diagnostics.pricing = {
       coveredSessions,
       uncoveredSessions: missingPricingSessions,
-      coveragePct: allSessions.length
-        ? Math.round((coveredSessions / allSessions.length) * 100)
-        : 100,
+      coveragePct: allSessions.length ? Math.round((coveredSessions / allSessions.length) * 100) : 100,
       uncoveredModels,
     };
     if (missingPricingSessions > 0) {
@@ -550,7 +455,86 @@ export async function GET() {
       );
     }
 
-    return NextResponse.json({
+    const modelBreakdown = Object.values(byModel)
+      .map((m) => ({ ...m, agents: Array.from(m.agents) }))
+      .sort((a, b) => b.totalTokens - a.totalTokens);
+
+    const agentBreakdown = Object.values(byAgent)
+      .map((a) => ({ ...a, models: Array.from(a.models) }))
+      .sort((a, b) => b.totalTokens - a.totalTokens);
+
+    const activitySeriesByModel: Record<string, Record<Period, ActivityPoint[]>> = {};
+    for (const model of modelBreakdown) {
+      activitySeriesByModel[model.model] =
+        ledger.activitySeriesByModel[model.fullModel] || ledger.activitySeries;
+    }
+
+    const response: UsageApiResponse & Record<string, unknown> = {
+      ok: true,
+      asOfMs: Date.now(),
+      liveTelemetry: {
+        totals: {
+          sessions: allSessions.length,
+          agents: agentIds.length,
+          models: Object.keys(byModel).length,
+          inputTokens: grandTotalInput,
+          outputTokens: grandTotalOutput,
+          reasoningTokens: 0,
+          cacheReadTokens: grandTotalCacheRead,
+          cacheWriteTokens: grandTotalCacheWrite,
+          totalTokens: grandTotalTokens,
+        },
+        windows: ledger.windows,
+        byModel: modelBreakdown.map((m) => ({
+          fullModel: m.fullModel,
+          provider: modelProvider(m.fullModel),
+          sessions: m.sessions,
+          totalTokens: m.totalTokens,
+          inputTokens: m.inputTokens,
+          outputTokens: m.outputTokens,
+          estimatedCostUsd: m.estimatedCostUsd,
+        })),
+        byAgent: agentBreakdown.map((a) => ({
+          agentId: a.agentId,
+          sessions: a.sessions,
+          totalTokens: a.totalTokens,
+          estimatedCostUsd: a.estimatedCostUsd,
+        })),
+        sourceLabel: "Local telemetry",
+      },
+      estimatedSpend: {
+        ...ledger.estimatedSpend,
+        sourceLabel: "Estimated from local telemetry and pricing",
+      },
+      providerBilling: {
+        providers: providerBilling,
+      },
+      reconciliation: {
+        summary: reconciliation.summary,
+        rows: reconciliation.rows,
+      },
+      freshness: {
+        localTelemetryMs: ledger.localTelemetryMs,
+        providerBillingByProvider: Object.fromEntries(
+          providerBilling.map((provider) => [provider.provider, provider.latestBucketStartMs]),
+        ),
+        reconciliationMs: reconciliation.lastRunMs,
+      },
+      coverage: {
+        estimatedPricingCoveragePct: diagnostics.pricing.coveragePct,
+        invoiceGradeProviders: ["openrouter", "openai", "anthropic"],
+        estimateOnlyProviders: [
+          ...new Set(modelBreakdown.map((model) => modelProvider(model.fullModel))),
+        ].filter((provider) => !["openrouter", "openai", "anthropic"].includes(provider)),
+      },
+      diagnostics: {
+        ...diagnostics,
+        sourceErrors: Object.entries(diagnostics.sources)
+          .filter(([, source]) => source.error)
+          .map(([source, value]) => ({ source, error: value.error || "unknown" })),
+      },
+
+      // Backward-compatible fields for the existing Usage UI.
       totals: {
         sessions: allSessions.length,
         inputTokens: grandTotalInput,
@@ -565,12 +549,37 @@ export async function GET() {
         totalCacheReadTokens: grandTotalCacheRead,
         totalCacheWriteTokens: grandTotalCacheWrite,
       },
-      buckets,
-      activitySeries,
+      buckets: {
+        last1h: {
+          input: ledger.windows.last1h.inputTokens,
+          output: ledger.windows.last1h.outputTokens,
+          total: ledger.windows.last1h.totalTokens,
+          sessions: ledger.windows.last1h.sessions,
+        },
+        last24h: {
+          input: ledger.windows.last24h.inputTokens,
+          output: ledger.windows.last24h.outputTokens,
+          total: ledger.windows.last24h.totalTokens,
+          sessions: ledger.windows.last24h.sessions,
+        },
+        last7d: {
+          input: ledger.windows.last7d.inputTokens,
+          output: ledger.windows.last7d.outputTokens,
+          total: ledger.windows.last7d.totalTokens,
+          sessions: ledger.windows.last7d.sessions,
+        },
+        allTime: {
+          input: ledger.windows.allTime.inputTokens,
+          output: ledger.windows.allTime.outputTokens,
+          total: ledger.windows.allTime.totalTokens,
+          sessions: ledger.windows.allTime.sessions,
+        },
+      },
+      activitySeries: ledger.activitySeries,
       activitySeriesByModel,
       modelBreakdown,
       agentBreakdown,
-      sessions: allSessions.slice(0, 50), // top 50 most recent
+      sessions: allSessions.slice(0, 50),
       peakSession: peakSession
         ? {
             sessionId: peakSession.sessionId,
@@ -591,16 +600,17 @@ export async function GET() {
             allowed: modelStatus.allowed,
             authProviders: (modelStatus.auth?.providers || []).map((p) => ({
               provider: p.provider,
-              authKind: p.effective.kind,
-              profiles: p.profiles.count,
+              authKind: p.effective?.kind || "unknown",
+              profiles: p.profiles?.count || 0,
             })),
           }
         : null,
       agentModels,
       sessionFileSizes,
-      historical,
-      diagnostics,
-    });
+      historical: ledger.historical,
+    };
+
+    return NextResponse.json(response);
   } catch (err) {
     console.error("Usage API error:", err);
     return NextResponse.json({ error: String(err) }, { status: 500 });
