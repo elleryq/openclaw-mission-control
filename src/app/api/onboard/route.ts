@@ -242,6 +242,44 @@ function normalizeBaseUrl(raw: string): string {
 }
 
 /**
+ * Extra safety check to prevent SSRF when probing custom endpoints.
+ * Only allow http/https schemes and disallow localhost/loopback/private IPs.
+ */
+function isSafeCustomEndpointUrl(raw: string): { ok: boolean; error?: string } {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw.trim());
+  } catch {
+    return { ok: false, error: "Base URL is not a valid URL" };
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return { ok: false, error: "Base URL must use http or https" };
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  // Block obvious local/loopback hostnames
+  if (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "::1"
+  ) {
+    return { ok: false, error: "Localhost URLs are not allowed for custom endpoints" };
+  }
+
+  // Best-effort block of common private IP ranges
+  if (
+    /^10\./.test(hostname) || // 10.0.0.0/8
+    /^192\.168\./.test(hostname) || // 192.168.0.0/16
+    /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(hostname) // 172.16.0.0 – 172.31.255.255
+  ) {
+    return { ok: false, error: "Private network addresses are not allowed for custom endpoints" };
+  }
+
+  return { ok: true };
+}
+
+/**
  * Probe a custom OpenAI-compatible endpoint by hitting GET /v1/models.
  * Returns { ok, models?, error? }.
  */
@@ -252,6 +290,11 @@ async function probeCustomEndpoint(
   const safety = isSafeExternalUrl(baseUrl);
   if (!safety.ok) {
     return { ok: false, error: safety.error || "Invalid base URL for custom endpoint" };
+  }
+
+  const extraSafety = isSafeCustomEndpointUrl(baseUrl);
+  if (!extraSafety.ok) {
+    return { ok: false, error: extraSafety.error || "Base URL is not allowed for custom endpoint" };
   }
 
   const url = `${normalizeBaseUrl(baseUrl)}/models`;
