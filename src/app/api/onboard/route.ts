@@ -24,6 +24,7 @@ import {
   PROVIDER_ENV_KEYS,
   validateProviderToken,
 } from "@/lib/provider-auth";
+import net from "net";
 
 export const dynamic = "force-dynamic";
 
@@ -165,6 +166,69 @@ async function ensureConfigValue(
 
 /* ── Custom OpenAI-compatible endpoint helpers ─────── */
 
+function isPrivateIp(hostname: string): boolean {
+  const ipType = net.isIP(hostname);
+  if (!ipType) return false;
+
+  // IPv4 private ranges and loopback
+  if (ipType === 4) {
+    const octets = hostname.split(".").map(Number);
+    const [o1, o2] = octets;
+    if (o1 === 10) return true; // 10.0.0.0/8
+    if (o1 === 172 && o2 >= 16 && o2 <= 31) return true; // 172.16.0.0/12
+    if (o1 === 192 && o2 === 168) return true; // 192.168.0.0/16
+    if (o1 === 127) return true; // 127.0.0.0/8 loopback
+    if (o1 === 169 && o2 === 254) return true; // 169.254.0.0/16 link-local
+  }
+
+  // Basic IPv6 checks: loopback and unique-local (fc00::/7), link-local (fe80::/10)
+  if (ipType === 6) {
+    const lower = hostname.toLowerCase();
+    if (lower === "::1") return true;
+    if (lower.startsWith("fc") || lower.startsWith("fd")) return true;
+    if (lower.startsWith("fe8") || lower.startsWith("fe9") || lower.startsWith("fea") || lower.startsWith("feb")) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Validate that a user-supplied URL is a safe external endpoint.
+ * Only allow http/https schemes and disallow localhost and private IP ranges.
+ */
+function isSafeExternalUrl(
+  raw: string,
+): { ok: boolean; error?: string } {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { ok: false, error: "Base URL is required for custom endpoints" };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return { ok: false, error: "Base URL must be an absolute URL including scheme (e.g. https://example.com)" };
+  }
+
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    return { ok: false, error: "Only http and https URLs are allowed for custom endpoints" };
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1") {
+    return { ok: false, error: "Local addresses are not allowed for custom endpoints" };
+  }
+
+  if (isPrivateIp(hostname)) {
+    return { ok: false, error: "Private network addresses are not allowed for custom endpoints" };
+  }
+
+  return { ok: true };
+}
+
 /**
  * Normalize a base URL: trim, strip trailing slashes, auto-append /v1 if missing.
  */
@@ -185,6 +249,11 @@ async function probeCustomEndpoint(
   baseUrl: string,
   token?: string,
 ): Promise<{ ok: boolean; models?: { id: string; name: string }[]; error?: string }> {
+  const safety = isSafeExternalUrl(baseUrl);
+  if (!safety.ok) {
+    return { ok: false, error: safety.error || "Invalid base URL for custom endpoint" };
+  }
+
   const url = `${normalizeBaseUrl(baseUrl)}/models`;
   const headers: Record<string, string> = {};
   if (token) headers.Authorization = `Bearer ${token}`;
