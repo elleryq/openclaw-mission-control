@@ -25,6 +25,7 @@ import {
   validateProviderToken,
 } from "@/lib/provider-auth";
 import net from "net";
+import dns from "dns/promises";
 
 export const dynamic = "force-dynamic";
 
@@ -242,6 +243,97 @@ function normalizeBaseUrl(raw: string): string {
 }
 
 /**
+ * Basic SSRF guard for external URLs.
+ * Ensures http/https scheme and rejects hostnames/IPs that resolve to localhost or private networks.
+ */
+async function isSafeExternalUrl(
+  raw: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { ok: false, error: "Base URL is empty" };
+  }
+
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return { ok: false, error: "Base URL is not a valid URL" };
+  }
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return { ok: false, error: "Only http and https schemes are allowed" };
+  }
+
+  const hostname = url.hostname.toLowerCase();
+  // Quick hostname-based filters
+  if (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "::1" ||
+    hostname.endsWith(".localhost") ||
+    hostname.endsWith(".local")
+  ) {
+    return { ok: false, error: "Localhost URLs are not allowed" };
+  }
+
+  // Resolve the hostname and check the resulting IP is not private/loopback.
+  try {
+    const lookupResult = await dns.lookup(hostname, { all: true });
+
+    const isPrivateOrLoopback = (ip: string): boolean => {
+      // IPv4 checks
+      const ipv4Match = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+      if (ipv4Match) {
+        const [_, aStr, bStr, cStr, dStr] = ipv4Match;
+        const a = Number(aStr);
+        const b = Number(bStr);
+        const c = Number(cStr);
+        const d = Number(dStr);
+        if ([a, b, c, d].some((octet) => Number.isNaN(octet) || octet < 0 || octet > 255)) {
+          return true;
+        }
+        // 127.0.0.0/8 loopback
+        if (a === 127) return true;
+        // 10.0.0.0/8
+        if (a === 10) return true;
+        // 172.16.0.0/12
+        if (a === 172 && b >= 16 && b <= 31) return true;
+        // 192.168.0.0/16
+        if (a === 192 && b === 168) return true;
+        // 169.254.0.0/16 link-local
+        if (a === 169 && b === 254) return true;
+        return false;
+      }
+
+      const ipv6 = ip.toLowerCase();
+      // IPv6 loopback
+      if (ipv6 === "::1") return true;
+      // IPv6 link-local fe80::/10
+      if (ipv6.startsWith("fe8") || ipv6.startsWith("fe9") || ipv6.startsWith("fea") || ipv6.startsWith("feb")) {
+        return true;
+      }
+      // Unique local fc00::/7
+      if (ipv6.startsWith("fc") || ipv6.startsWith("fd")) {
+        return true;
+      }
+      return false;
+    };
+
+    for (const addr of lookupResult) {
+      if (isPrivateOrLoopback(addr.address)) {
+        return { ok: false, error: "Base URL resolves to a private or loopback address" };
+      }
+    }
+  } catch {
+    // If DNS resolution fails, treat as unsafe to be conservative.
+    return { ok: false, error: "Could not resolve base URL host" };
+  }
+
+  return { ok: true };
+}
+
+/**
  * Extra safety check to prevent SSRF when probing custom endpoints.
  * Only allow http/https schemes and disallow localhost/loopback/private IPs.
  */
@@ -287,7 +379,7 @@ async function probeCustomEndpoint(
   baseUrl: string,
   token?: string,
 ): Promise<{ ok: boolean; models?: { id: string; name: string }[]; error?: string }> {
-  const safety = isSafeExternalUrl(baseUrl);
+  const safety = await isSafeExternalUrl(baseUrl);
   if (!safety.ok) {
     return { ok: false, error: safety.error || "Invalid base URL for custom endpoint" };
   }
